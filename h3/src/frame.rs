@@ -25,6 +25,9 @@ pub struct FrameStream<S, B> {
     // Already read data from the stream
     decoder: FrameDecoder,
     remaining_data: usize,
+    // A transport error observed while buffered frame bytes still remain.
+    // Deliver those bytes first, then surface this error exactly once.
+    pending_quic_error: Option<FrameStreamError>,
 }
 
 impl<S, B> FrameStream<S, B> {
@@ -33,6 +36,7 @@ impl<S, B> FrameStream<S, B> {
             stream,
             decoder: FrameDecoder::default(),
             remaining_data: 0,
+            pending_quic_error: None,
         }
     }
 
@@ -76,10 +80,17 @@ where
             // CONNECTION_CLOSE frame coalesced with stream data in the
             // same recv batch wins the race and discards a fully-
             // decodable HEADERS frame.
-            let (end, pending_quic_err) = match self.try_recv(cx) {
-                Poll::Ready(Ok(end)) => (Poll::Ready(end), None),
-                Poll::Pending => (Poll::Pending, None),
-                Poll::Ready(Err(e)) => (Poll::Ready(true), Some(e)),
+            let end = if self.pending_quic_error.is_some() {
+                Poll::Ready(true)
+            } else {
+                match self.try_recv(cx) {
+                    Poll::Ready(Ok(end)) => Poll::Ready(end),
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Err(error)) => {
+                        self.pending_quic_error = Some(error);
+                        Poll::Ready(true)
+                    }
+                }
             };
 
             return match self.decoder.decode(self.stream.buf_mut())? {
@@ -92,17 +103,17 @@ where
                     Poll::Ready(Ok(frame))
                 }
                 Some(frame) => Poll::Ready(Ok(Some(frame))),
-                None => match (end, pending_quic_err) {
+                None => match end {
                     // Decoder couldn't make progress on buffered bytes
                     // and the underlying QUIC stream errored: surface
-                    // the cached error now. Fixed-point: this branch
-                    // terminates the loop because we consume the cached
-                    // error in the same iteration we observed it.
-                    (_, Some(err)) => Poll::Ready(Err(err)),
+                    // the cached error now.
+                    _ if self.pending_quic_error.is_some() => {
+                        Poll::Ready(Err(self.pending_quic_error.take().unwrap()))
+                    }
                     // Received a chunk but frame is incomplete, poll until we get `Pending`.
-                    (Poll::Ready(false), None) => continue,
-                    (Poll::Pending, None) => Poll::Pending,
-                    (Poll::Ready(true), None) => {
+                    Poll::Ready(false) => continue,
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(true) => {
                         if self.stream.buf_mut().has_remaining() {
                             // Reached the end of receive stream, but there is still some data:
                             // The frame is incomplete.
@@ -130,27 +141,35 @@ where
 
         // Mirror the hoist from poll_next: a QUIC-level error must not
         // discard already-buffered body bytes for the current frame.
-        let (end, pending_quic_err) = match self.try_recv(cx) {
-            Poll::Ready(Ok(end)) => (end, None),
-            Poll::Ready(Err(e)) => (true, Some(e)),
-            Poll::Pending => (false, None),
+        let end = if self.pending_quic_error.is_some() {
+            true
+        } else {
+            match self.try_recv(cx) {
+                Poll::Ready(Ok(end)) => end,
+                Poll::Ready(Err(error)) => {
+                    self.pending_quic_error = Some(error);
+                    true
+                }
+                Poll::Pending => false,
+            }
         };
         let data = self.stream.buf_mut().take_chunk(self.remaining_data);
 
-        match (data, end, pending_quic_err) {
+        match (data, end, self.pending_quic_error.is_some()) {
             // No more buffered body and QUIC errored: surface the error.
-            (None, _, Some(err)) => Poll::Ready(Err(err)),
-            (None, true, None) => Poll::Ready(Ok(None)),
-            (None, false, None) => Poll::Pending,
+            (None, _, true) => Poll::Ready(Err(self.pending_quic_error.take().unwrap())),
+            (None, true, false) => Poll::Ready(Ok(None)),
+            (None, false, false) => Poll::Pending,
             // Partial body for the current frame and the underlying
             // stream / connection ended: caller MUST treat this as
             // truncation. Same shape as the existing `Poll::Ready(true)`
             // branch below — extended to also cover the QUIC error case.
             (Some(d), end_or_err, pending)
-                if (end_or_err || pending.is_some())
+                if (end_or_err || pending)
                     && d.remaining() < self.remaining_data
                     && !self.stream.buf_mut().has_remaining() =>
             {
+                self.pending_quic_error.take();
                 Poll::Ready(Err(FrameStreamError::UnexpectedEnd))
             }
             (Some(d), _, _) => {
@@ -227,11 +246,13 @@ where
                 stream: send,
                 decoder: FrameDecoder::default(),
                 remaining_data: 0,
+                pending_quic_error: None,
             },
             FrameStream {
                 stream: recv,
                 decoder: self.decoder,
                 remaining_data: self.remaining_data,
+                pending_quic_error: self.pending_quic_error,
             },
         )
     }
@@ -474,21 +495,18 @@ mod tests {
         let mut recv = FakeRecv::default();
         let mut buf = BytesMut::with_capacity(64);
         Frame::headers(&b"header"[..]).encode_with_payload(&mut buf);
-        // Headers chunk is fully buffered, then poll_data signals a
-        // connection-level error on the next poll — exactly the
-        // shape produced by an io_uring-coalesced datagram with
-        // STREAM(FIN) + CONNECTION_CLOSE(H3_NO_ERROR).
-        recv.chunk_then_error(
-            buf.freeze(),
-            StreamErrorIncoming::ConnectionErrorIncoming {
-                connection_error: ConnectionErrorIncoming::ApplicationClose { error_code: 0x100 },
-            },
-        );
+        recv.pending_error = Some(StreamErrorIncoming::ConnectionErrorIncoming {
+            connection_error: ConnectionErrorIncoming::ApplicationClose { error_code: 0x100 },
+        });
         let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+        // Model bytes that the buffered stream already retained before
+        // its underlying transport reported the terminal error.
+        let mut buffered = buf.freeze();
+        stream.stream.buf_mut().push_bytes(&mut buffered);
 
-        // First poll: drains buffered HEADERS frame instead of erroring.
+        // First poll observes the error but drains the buffered HEADERS.
         assert_poll_matches!(|cx| stream.poll_next(cx), Ok(Some(Frame::Headers(_))));
-        // Second poll: nothing left to decode, error surfaces.
+        // Second poll surfaces the saved error without polling transport again.
         assert_poll_matches!(|cx| stream.poll_next(cx), Err(FrameStreamError::Quic(_)));
     }
 
@@ -519,6 +537,10 @@ mod tests {
             |cx| to_bytes(stream.poll_data(cx)),
             Ok(Some(b)) if b.remaining() == 4
         );
+        // The connection error must remain observable after the buffered
+        // DATA body has been delivered. Otherwise a non-graceful close is
+        // silently turned into a clean end of stream for the caller.
+        assert_poll_matches!(|cx| stream.poll_next(cx), Err(FrameStreamError::Quic(_)));
     }
 
     #[tokio::test]
