@@ -76,6 +76,19 @@ impl Builder {
         self
     }
 
+    /// Limits the encoded payload of each incoming non-DATA frame.
+    ///
+    /// The default is 64 KiB. Unlike [`Self::max_field_section_size`], this is a
+    /// local buffering limit, checked before receiving the complete payload and
+    /// not advertised to the peer. It covers HEADERS (including trailers),
+    /// control frames, and unknown frame types. Larger frames cause a connection
+    /// error of type H3_EXCESSIVE_LOAD. Increase it to accept larger encoded
+    /// headers. DATA and WebTransport stream payloads are streamed and exempt.
+    pub fn max_non_data_frame_size(&mut self, value: usize) -> &mut Self {
+        self.config.max_non_data_frame_size = value;
+        self
+    }
+
     /// Send grease values to the Client.
     /// See [setting](https://www.rfc-editor.org/rfc/rfc9114.html#settings-parameters), [frame](https://www.rfc-editor.org/rfc/rfc9114.html#frame-reserved) and [stream](https://www.rfc-editor.org/rfc/rfc9114.html#stream-grease) for more information.
     #[inline]

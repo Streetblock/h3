@@ -2,10 +2,14 @@ use std::convert::TryFrom;
 
 use crate::proto::{frame, varint::VarInt};
 
+pub(crate) const DEFAULT_MAX_NON_DATA_FRAME_SIZE: usize = 64 * 1024;
+
 /// Configures the HTTP/3 connection
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct Config {
+    /// Maximum encoded payload size buffered for an incoming non-DATA frame.
+    pub(crate) max_non_data_frame_size: usize,
     /// Just like in HTTP/2, HTTP/3 also uses the concept of "grease"
     /// to prevent potential interoperability issues in the future.
     /// In HTTP/3, the concept of grease is used to ensure that the protocol can evolve
@@ -75,6 +79,7 @@ impl TryFrom<Config> for frame::Settings {
         let mut settings = frame::Settings::default();
 
         let Config {
+            max_non_data_frame_size: _,
             send_grease,
             #[cfg(test)]
                 send_settings: _,
@@ -170,6 +175,7 @@ impl Settings {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            max_non_data_frame_size: DEFAULT_MAX_NON_DATA_FRAME_SIZE,
             send_grease: true,
             #[cfg(test)]
             send_settings: true,

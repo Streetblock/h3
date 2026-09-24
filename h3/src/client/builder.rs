@@ -88,6 +88,19 @@ impl Builder {
         self
     }
 
+    /// Limits the encoded payload of each incoming non-DATA frame.
+    ///
+    /// The default is 64 KiB. Unlike [`Self::max_field_section_size`], this is a
+    /// local buffering limit, checked before receiving the complete payload and
+    /// not advertised to the peer. It covers HEADERS (including trailers),
+    /// control frames, and unknown frame types. Larger frames cause a connection
+    /// error of type H3_EXCESSIVE_LOAD. Increase it to accept larger encoded
+    /// headers. DATA and WebTransport stream payloads are streamed and exempt.
+    pub fn max_non_data_frame_size(&mut self, value: usize) -> &mut Self {
+        self.config.max_non_data_frame_size = value;
+        self
+    }
+
     /// Just like in HTTP/2, HTTP/3 also uses the concept of "grease"
     /// to prevent potential interoperability issues in the future.
     /// In HTTP/3, the concept of grease is used to ensure that the protocol can evolve
@@ -131,6 +144,7 @@ impl Builder {
             open,
             conn_state,
             max_field_section_size: self.config.settings.max_field_section_size,
+            max_non_data_frame_size: self.config.max_non_data_frame_size,
             sender_count: Arc::new(AtomicUsize::new(1)),
             send_grease_frame: self.config.send_grease,
             _buf: PhantomData,

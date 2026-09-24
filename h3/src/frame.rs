@@ -36,6 +36,14 @@ impl<S, B> FrameStream<S, B> {
         }
     }
 
+    /// Sets the maximum encoded payload size buffered for a non-DATA frame.
+    /// DATA and WebTransport stream payloads are not subject to this limit.
+    pub fn with_max_non_data_frame_size(mut self, max: usize) -> Self {
+        self.decoder.max_non_data_frame_size = max;
+        self.decoder.expected = None;
+        self
+    }
+
     /// Unwraps the Framed streamer and returns the underlying stream **without** data loss for
     /// partially received/read frames.
     pub fn into_inner(self) -> BufRecvStream<S, B> {
@@ -212,9 +220,18 @@ where
     }
 }
 
-#[derive(Default)]
 pub struct FrameDecoder {
     expected: Option<usize>,
+    max_non_data_frame_size: usize,
+}
+
+impl Default for FrameDecoder {
+    fn default() -> Self {
+        Self {
+            expected: None,
+            max_non_data_frame_size: crate::config::DEFAULT_MAX_NON_DATA_FRAME_SIZE,
+        }
+    }
 }
 
 impl FrameDecoder {
@@ -237,7 +254,7 @@ impl FrameDecoder {
 
             let (pos, decoded) = {
                 let mut cur = src.cursor();
-                let decoded = Frame::decode(&mut cur);
+                let decoded = Frame::decode_with_limit(&mut cur, self.max_non_data_frame_size);
                 (cur.position(), decoded)
             };
 
@@ -267,6 +284,12 @@ impl FrameDecoder {
                     return Ok(Some(frame));
                 }
                 // -------------- Map the error Values --------------
+                Err(frame::FrameError::TooLarge { length, max }) => {
+                    return Err(FrameStreamError::Proto(FrameProtocolError::TooLarge {
+                        length,
+                        max,
+                    }));
+                }
                 Err(frame::FrameError::InvalidStreamId(e)) => {
                     return Err(FrameStreamError::Proto(
                         FrameProtocolError::InvalidStreamId(e),
@@ -309,6 +332,7 @@ pub enum FrameStreamError {
 #[derive(Debug, PartialEq)]
 /// Protocol specific errors that can occur while decoding frames in a stream
 pub enum FrameProtocolError {
+    TooLarge { length: u64, max: usize },
     Malformed,
     ForbiddenFrame(u64), // Known (http2) frames that should generate an error
     InvalidFrameValue,
@@ -400,6 +424,150 @@ mod tests {
     }
 
     // FrameStream
+
+    #[tokio::test]
+    async fn oversized_incomplete_headers_do_not_buffer_the_announced_payload() {
+        // Keep this regression independent of new configuration/error APIs so
+        // it can also be run against the original decoder.
+        let mut header = BytesMut::new();
+        FrameType::HEADERS.encode(&mut header);
+        VarInt::try_from(256 * 1024_u64)
+            .unwrap()
+            .encode(&mut header);
+        let header_len = header.len();
+        let mut recv = FakeRecv::default();
+        recv.chunk(header.freeze());
+        for _ in 0..128 {
+            recv.chunk(Bytes::from(vec![0_u8; 1024]));
+        }
+        let polls = recv.poll_count.clone();
+        let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+
+        let result = poll_fn(|cx| stream.poll_next(cx)).await;
+        let buffered = stream.stream.buf().remaining();
+        assert!(
+            matches!(result, Err(FrameStreamError::Proto(_))),
+            "expected rejection from the frame header, got {:?}; retained {} bytes after {} transport polls",
+            result, buffered, polls.get(),
+        );
+        assert_eq!(polls.get(), 1);
+        assert_eq!(buffered, header_len);
+    }
+
+    #[test]
+    fn non_data_frame_lengths_are_checked_before_payload_arrives() {
+        for ty in [
+            FrameType::HEADERS,
+            FrameType::SETTINGS,
+            FrameType::PUSH_PROMISE,
+            FrameType::GOAWAY,
+            FrameType::CANCEL_PUSH,
+            FrameType::MAX_PUSH_ID,
+            FrameType::RESERVED,
+        ] {
+            let mut header = BytesMut::new();
+            ty.encode(&mut header);
+            VarInt::MAX.encode(&mut header);
+            let mut buf = BufList::from(header);
+            let mut decoder = FrameDecoder::default();
+            assert_matches!(
+                decoder.decode(&mut buf),
+                Err(FrameStreamError::Proto(FrameProtocolError::TooLarge { .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn split_type_and_length_varints_are_bounded_as_soon_as_complete() {
+        let mut header = BytesMut::new();
+        FrameType::RESERVED.encode(&mut header);
+        VarInt::MAX.encode(&mut header);
+        let mut buf = BufList::new();
+        let mut decoder = FrameDecoder::default();
+        for byte in &header[..header.len() - 1] {
+            buf.push(Bytes::copy_from_slice(&[*byte]));
+            assert_matches!(decoder.decode(&mut buf), Ok(None));
+        }
+        buf.push(Bytes::copy_from_slice(&header[header.len() - 1..]));
+        assert_matches!(
+            decoder.decode(&mut buf),
+            Err(FrameStreamError::Proto(FrameProtocolError::TooLarge { .. }))
+        );
+        assert_eq!(buf.remaining(), header.len());
+    }
+
+    #[tokio::test]
+    async fn configured_limit_accepts_boundary_and_rejects_trailers_above_it() {
+        let mut recv = FakeRecv::default();
+        let mut headers = BytesMut::new();
+        Frame::headers(&b"12345"[..]).encode_with_payload(&mut headers);
+        Frame::Data(&b""[..]).encode_with_payload(&mut headers);
+        FrameType::HEADERS.encode(&mut headers);
+        VarInt::from_u32(6).encode(&mut headers);
+        recv.chunk(headers.freeze());
+        let mut stream: FrameStream<_, ()> =
+            FrameStream::new(BufRecvStream::new(recv)).with_max_non_data_frame_size(5);
+        assert_matches!(
+            poll_fn(|cx| stream.poll_next(cx)).await,
+            Ok(Some(Frame::Headers(_)))
+        );
+        assert_matches!(
+            poll_fn(|cx| stream.poll_next(cx)).await,
+            Ok(Some(Frame::Data(PayloadLen(0))))
+        );
+        assert_matches!(
+            poll_fn(|cx| stream.poll_next(cx)).await,
+            Err(FrameStreamError::Proto(FrameProtocolError::TooLarge {
+                length: 6,
+                max: 5
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn configurable_limit_can_accept_larger_encoded_headers() {
+        let mut bytes = BytesMut::new();
+        Frame::headers(Bytes::from(vec![0_u8; 128 * 1024])).encode_with_payload(&mut bytes);
+        let mut recv = FakeRecv::default();
+        recv.chunk(bytes.freeze());
+        let mut stream: FrameStream<_, ()> =
+            FrameStream::new(BufRecvStream::new(recv)).with_max_non_data_frame_size(128 * 1024);
+        assert_matches!(poll_fn(|cx| stream.poll_next(cx)).await, Ok(Some(Frame::Headers(headers))) if headers.len() == 128 * 1024);
+    }
+
+    #[test]
+    fn data_and_webtransport_prefixes_are_exempt_from_buffered_frame_limit() {
+        let mut data = BytesMut::new();
+        FrameType::DATA.encode(&mut data);
+        VarInt::from_u32(1024 * 1024).encode(&mut data);
+        let mut decoder = FrameDecoder {
+            max_non_data_frame_size: 0,
+            ..FrameDecoder::default()
+        };
+        assert_matches!(
+            decoder.decode(&mut BufList::from(data)),
+            Ok(Some(Frame::Data(PayloadLen(1_048_576))))
+        );
+
+        let mut webtransport = BytesMut::new();
+        FrameType::WEBTRANSPORT_BI_STREAM.encode(&mut webtransport);
+        VarInt::from_u32(1024 * 1024).encode(&mut webtransport);
+        assert_matches!(
+            decoder.decode(&mut BufList::from(webtransport)),
+            Ok(Some(Frame::WebTransportStream(_)))
+        );
+    }
+
+    #[test]
+    fn frame_size_failure_uses_excessive_load_connection_error() {
+        let error = crate::error::internal_error::InternalConnectionError::got_frame_error(
+            FrameProtocolError::TooLarge {
+                length: 128 * 1024,
+                max: 64 * 1024,
+            },
+        );
+        assert_eq!(error.code, Code::H3_EXCESSIVE_LOAD);
+    }
 
     macro_rules! assert_poll_matches {
         ($poll_fn:expr, $match:pat) => {

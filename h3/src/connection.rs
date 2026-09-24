@@ -430,7 +430,7 @@ where
                 Poll::Pending => continue,
             };
 
-            match resolved.into_stream() {
+            match resolved.into_stream(self.config.max_non_data_frame_size) {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
                 //# Only one control stream per peer is permitted;
                 //# receipt of a second stream claiming to be a control stream MUST be

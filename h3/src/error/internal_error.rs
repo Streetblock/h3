@@ -29,6 +29,13 @@ impl InternalConnectionError {
     /// Creates a new internal connection error from a frame error
     pub fn got_frame_error(value: FrameProtocolError) -> Self {
         match value {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-10.5
+            //# An endpoint MAY treat activity that is suspicious as a connection
+            //# error of type H3_EXCESSIVE_LOAD.
+            FrameProtocolError::TooLarge { length, max } => InternalConnectionError {
+                code: Code::H3_EXCESSIVE_LOAD,
+                message: format!("frame payload size {} exceeds limit {}", length, max),
+            },
             FrameProtocolError::InvalidStreamId(id) => InternalConnectionError {
                 code: Code::H3_ID_ERROR,
                 message: format!("invalid stream id: {}", id),

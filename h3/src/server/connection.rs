@@ -145,6 +145,7 @@ where
         &mut self,
         stream: FrameStream<C::BidiStream, B>,
     ) -> RequestResolver<C, B> {
+        let stream = stream.with_max_non_data_frame_size(self.inner.config.max_non_data_frame_size);
         let send_grease_frame = self.inner.send_grease_frame;
         // send the grease frame only once per connection
         self.inner.send_grease_frame = false;

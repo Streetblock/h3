@@ -17,6 +17,7 @@ use super::{
 
 #[derive(Debug, PartialEq)]
 pub enum FrameError {
+    TooLarge { length: u64, max: usize },
     Malformed,
     UnsupportedFrame(u64), // Known frames that should generate an error
     UnknownFrame(u64),     // Unknown frames that should be ignored
@@ -32,6 +33,9 @@ impl std::error::Error for FrameError {}
 impl fmt::Display for FrameError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            FrameError::TooLarge { length, max } => {
+                write!(f, "frame payload size {} exceeds limit {}", length, max)
+            }
             FrameError::Malformed => write!(f, "frame is malformed"),
             FrameError::UnsupportedFrame(c) => write!(f, "frame 0x{:x} is not allowed h3", c),
             FrameError::UnknownFrame(c) => write!(f, "frame 0x{:x} ignored", c),
@@ -80,6 +84,15 @@ impl Frame<PayloadLen> {
 
     /// Decodes a Frame from the stream according to <https://www.rfc-editor.org/rfc/rfc9114#section-7.1>
     pub fn decode<T: Buf>(buf: &mut T) -> Result<Self, FrameError> {
+        Self::decode_with_limit(buf, crate::config::DEFAULT_MAX_NON_DATA_FRAME_SIZE)
+    }
+
+    /// Decodes a frame while bounding the encoded payload of non-DATA frames.
+    /// DATA and WebTransport payloads are streamed rather than buffered here.
+    pub fn decode_with_limit<T: Buf>(
+        buf: &mut T,
+        max_non_data_frame_size: usize,
+    ) -> Result<Self, FrameError> {
         let remaining = buf.remaining();
         let ty = FrameType::decode(buf).map_err(|_| FrameError::Incomplete(remaining + 1))?;
 
@@ -93,41 +106,68 @@ impl Frame<PayloadLen> {
             return Ok(Frame::WebTransportStream(SessionId::decode(buf)?));
         }
 
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
+        //# These frame
+        //# types MUST NOT be sent, and their receipt MUST be treated as a
+        //# connection error of type H3_FRAME_UNEXPECTED.
+        if matches!(
+            ty,
+            FrameType::H2_PRIORITY
+                | FrameType::H2_PING
+                | FrameType::H2_WINDOW_UPDATE
+                | FrameType::H2_CONTINUATION
+        ) {
+            return Err(FrameError::UnsupportedFrame(ty.0));
+        }
+
         let len = buf
             .get_var()
             .map_err(|_| FrameError::Incomplete(remaining + 1))?;
 
+        if ty != FrameType::DATA && len > max_non_data_frame_size as u64 {
+            return Err(FrameError::TooLarge {
+                length: len,
+                max: max_non_data_frame_size,
+            });
+        }
+        let payload_len: usize = len.try_into().map_err(|_| FrameError::TooLarge {
+            length: len,
+            max: usize::MAX,
+        })?;
         if ty == FrameType::DATA {
-            return Ok(Frame::Data((len as usize).into()));
+            return Ok(Frame::Data(payload_len.into()));
         }
 
-        if buf.remaining() < len as usize {
-            return Err(FrameError::Incomplete(2 + len as usize));
+        let frame_len = (remaining - buf.remaining())
+            .checked_add(payload_len)
+            .ok_or(FrameError::TooLarge {
+                length: len,
+                max: usize::MAX.saturating_sub(VarInt::MAX_SIZE * 2),
+            })?;
+        if buf.remaining() < payload_len {
+            return Err(FrameError::Incomplete(frame_len));
         }
 
-        let mut payload = buf.take(len as usize);
+        let mut payload = buf.take(payload_len);
 
         #[cfg(feature = "tracing")]
         trace!("frame ty: {:?}", ty);
 
         let frame = match ty {
-            FrameType::HEADERS => Ok(Frame::Headers(payload.copy_to_bytes(len as usize))),
+            FrameType::HEADERS => Ok(Frame::Headers(payload.copy_to_bytes(payload_len))),
             FrameType::SETTINGS => Ok(Frame::Settings(Settings::decode(&mut payload)?)),
             FrameType::CANCEL_PUSH => Ok(Frame::CancelPush(payload.get_var()?.try_into()?)),
             FrameType::PUSH_PROMISE => Ok(Frame::PushPromise(PushPromise::decode(&mut payload)?)),
             FrameType::GOAWAY => Ok(Frame::Goaway(VarInt::decode(&mut payload)?)),
             FrameType::MAX_PUSH_ID => Ok(Frame::MaxPushId(payload.get_var()?.try_into()?)),
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
-            //# These frame
-            //# types MUST NOT be sent, and their receipt MUST be treated as a
-            //# connection error of type H3_FRAME_UNEXPECTED.
             FrameType::H2_PRIORITY
             | FrameType::H2_PING
             | FrameType::H2_WINDOW_UPDATE
-            | FrameType::H2_CONTINUATION => Err(FrameError::UnsupportedFrame(ty.0)),
-            FrameType::WEBTRANSPORT_BI_STREAM | FrameType::DATA => unreachable!(),
+            | FrameType::H2_CONTINUATION
+            | FrameType::WEBTRANSPORT_BI_STREAM
+            | FrameType::DATA => unreachable!(),
             _ => {
-                buf.advance(len as usize);
+                buf.advance(payload_len);
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
                 //# Endpoints MUST
                 //# NOT consider these frames to have any meaning upon receipt.
